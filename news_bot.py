@@ -23,6 +23,11 @@ def call_poe(model, messages):
     return response.choices[0].message.content
 
 
+def clean_text(text):
+    """去掉 Markdown 的加粗符号 **"""
+    return text.replace("**", "")
+
+
 def get_daily_news():
     beijing_tz = timezone(timedelta(hours=8))
     today = datetime.now(beijing_tz).strftime("%Y年%m月%d日")
@@ -35,7 +40,14 @@ def get_daily_news():
 
 1. 搜索范围要覆盖：北美、欧洲、中国、东亚（日韩）、东南亚、南亚（印度）、澳大利亚、中东、非洲、拉美。
 
-2. 筛选标准（只挑真正有价值的）：
+2. 信息来源要求（非常重要）：
+   - 必须优先搜索国际主流英文媒体，包括但不限于：Reuters、Bloomberg、Financial Times、The Wall Street Journal、CNBC、TechCrunch、The Verge、Nikkei Asia、The Economist、MIT Technology Review、South China Morning Post、Al Jazeera、BBC Business 等
+   - 至少一半以上的信息源必须来自英文媒体
+   - 中文媒体（如财新、第一财经、36氪等）可以作为补充，但不能是唯一来源
+   - 每条新闻都必须标注来源媒体的英文或中文名称
+   - 搜索时请同时使用英文关键词搜索，不要只用中文关键词
+
+3. 筛选标准（只挑真正有价值的）：
    - 各国重大经济政策变动（关税、监管、利率等）
    - 新兴市场的商业机会
    - 全球巨头的重要动作（收购、扩张、裁员、新业务）
@@ -44,7 +56,7 @@ def get_daily_news():
    - 消费趋势变化
    - 中文互联网很少报道但其实很重要的事
 
-3. 严格按以下格式输出：
+4. 严格按以下格式输出：
 
 📰 全球商业日报 | {today}
 
@@ -94,15 +106,16 @@ def get_daily_news():
 💡 今日风向
 [一段话总结今天全球商业的整体风向，指出值得持续关注的趋势]
 
-4. 重要规则：
+5. 重要规则：
    - 只报道过去24小时内的新闻，严禁使用超过1天的旧闻，如果无法确认是24小时内的，宁可不报道
    - 如果某个地区今天没有值得报道的新闻，直接跳过该地区
    - 全部用中文
    - 简洁有力，不要废话套话
    - 保持客观中立
-   - 每条新闻都必须标注来源媒体名称（如：路透社、彭博社、Financial Times等），不能只放链接，必须写出媒体名
+   - 每条新闻都必须标注来源媒体名称（如：Reuters、Bloomberg、Financial Times等），不能只放链接，必须写出媒体名
    - 来源不明或无法确认的新闻不要使用
-   - 全文不要出现"AI"这个词，你就是一位人类编辑"""
+   - 全文不要出现"AI"这个词，你就是一位人类编辑
+   - 全文不要使用任何Markdown格式符号，不要用星号加粗，不要用井号标题，输出纯文本"""
 
     try:
         print("正在通过 Poe API 调用 Web-Search...")
@@ -130,68 +143,6 @@ def get_daily_news():
         except Exception as e2:
             print(f"备用方案也失败: {e2}")
             return None
-
-
-def rewrite_for_wechat(daily_news):
-    beijing_tz = timezone(timedelta(hours=8))
-    today = datetime.now(beijing_tz).strftime("%Y年%m月%d日")
-
-    prompt = f"""你是微信公众号「奇怪地球咨询社」的写手，口头禅是"抹平全球市场的信息差！"
-
-请根据以下全球商业日报素材，改写为一篇适合公众号发布的推文。
-
-⚠️⚠️⚠️ 最最最重要的规则：
-- 你只需要输出【改写后的公众号推文】，绝对不要把原始素材再输出一遍！
-- 不要先输出日报再输出推文，只输出推文本身！
-- 全文不要出现"AI"这两个字母的组合！不要说"AI点评"、"AI分析"等任何包含AI的表述！
-- 不要使用表格（table），用列表或分段代替！
-
-## 今日日报素材（仅供参考，不要原样输出）：
-{daily_news}
-
-## 保持和日报一致的结构：
-- 保留「今日最值得关注的3件事」
-- 保留「分区速览」的各地区板块（日报有哪些地区你就保留哪些）
-- 保留最后的点评总结（命名为「我的判断」）
-- 不要重新组织结构、不要合并板块、不要改成01｜02｜03的文章体
-
-## 你要做的改动（只改风格和深度，不改结构）：
-
-1. 加一个有冲击力的标题（问句或感叹句，有信息量但不低俗）
-
-2. 开头加一段个人化的引入（1-3句话），用第一人称，像博主跟读者打招呼
-   - 例如"今早被推送炸醒的""刷了十分钟新闻人都麻了"这种生活场景感
-
-3. 每条新闻在保留原有信息的基础上，加入：
-   - **中国视角**：跟中国人有什么关系？对A股/人民币/大宗商品/出海企业有什么影响？中国的机遇在哪？
-   - **个人点评**：用一两句口语化的话说出你的判断，比如"说白了就是…""懂的都懂""这个信号很值得注意"
-   - 敏感实体用模糊化处理（如"波斯方面""巴铁""美方""以方"等）
-
-4. 最后的点评总结命名为「🧐 我的判断」，用第一人称，更主观、更有态度，但不偏激
-
-5. 结尾加上：
-   - 一句个人感悟
-   - "关注「奇怪地球咨询社」，抹平全球市场的信息差！"
-   - "⚠️ 以上内容基于公开信息和个人研判，不构成投资建议。"
-
-## 语言风格（贯穿全文）
-- 像跟朋友聊天，口语化，不要书面腔
-- 绝对不能读起来像机器写的——避免工整排比、避免空洞形容词堆砌
-- 可以用："说白了""懂的都懂""说句大实话""各位自己想吧""不用我多说吧"
-- 长短句交替，关键判断加粗，偶尔用emoji但别满屏都是
-- 段落要短，适合手机阅读，一段最多4-5行
-- 信源/数据要保留，但表达方式要轻松
-
-## 再次提醒：只输出改写后的推文！不要输出原始日报！不要出现"AI"！"""
-
-    try:
-        print("正在生成公众号推文版本...")
-        result = call_poe("Web-Search", [{"role": "user", "content": prompt}])
-        print("公众号推文生成完成！")
-        return result
-    except Exception as e:
-        print(f"公众号推文生成失败: {e}")
-        return None
 
 
 def send_telegram(text):
@@ -231,26 +182,14 @@ def send_telegram(text):
 def main():
     print("开始执行每日全球商业新闻任务...")
 
-    # 第一步：生成详细日报
     daily_news = get_daily_news()
 
     if daily_news:
-        # 发送第一条：完整日报
-        print("发送第一条：完整日报...")
+        # 清理掉 Markdown 加粗符号
+        daily_news = clean_text(daily_news)
+        print("发送日报...")
         send_telegram(daily_news)
-
-        # 第二步：基于日报生成公众号推文
-        time.sleep(5)
-        wechat_post = rewrite_for_wechat(daily_news)
-
-        if wechat_post:
-            # 发送第二条：公众号推文版
-            print("发送第二条：公众号推文版...")
-            header = "✍️ 以下是公众号「奇怪地球咨询社」推文版本：\n\n"
-            send_telegram(header + wechat_post)
-            print("两条消息全部发送完成！")
-        else:
-            send_telegram("⚠️ 公众号推文版本生成失败")
+        print("发送完成！")
     else:
         send_telegram("⚠️ 今天新闻获取失败，请检查 Poe API。")
         print("任务失败")
