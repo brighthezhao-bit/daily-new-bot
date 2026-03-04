@@ -1,6 +1,7 @@
 import openai
 import requests
 import os
+import re
 import time
 from datetime import datetime, timezone, timedelta
 
@@ -26,6 +27,38 @@ def call_poe(model, messages):
 def clean_text(text):
     """去掉 Markdown 的加粗符号 **"""
     return text.replace("**", "")
+
+
+def strip_english_preamble(text):
+    """
+    去掉 Web-Search 模型返回的英文前缀垃圾。
+    策略：找到正文真正开始的标志性 emoji 或中文内容，把前面的全砍掉。
+    """
+    # 尝试找到内容的真正起始点（各种可能的开头标志）
+    markers = ["📰", "📊", "🔥", "💹", "🌍", "🌐"]
+    earliest_pos = len(text)
+
+    for marker in markers:
+        pos = text.find(marker)
+        if pos != -1 and pos < earliest_pos:
+            earliest_pos = pos
+
+    # 如果找到了标志性 emoji，把前面的都砍掉
+    if earliest_pos < len(text) and earliest_pos > 0:
+        stripped = text[earliest_pos:]
+        print(f"已清理前缀（去掉了前 {earliest_pos} 个字符）")
+        return stripped
+
+    # 如果没找到 emoji 标志，尝试用正则：找到第一行包含中文的内容
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if re.search(r'[\u4e00-\u9fff]', line) and len(line.strip()) > 5:
+            result = "\n".join(lines[i:])
+            print(f"已通过中文检测清理前缀（跳过了前 {i} 行）")
+            return result
+
+    # 实在找不到就原样返回
+    return text
 
 
 def get_daily_news():
@@ -56,7 +89,7 @@ def get_daily_news():
    - 消费趋势变化
    - 中文互联网很少报道但其实很重要的事
 
-4. 严格按以下格式输出：
+4. 严格按以下格式输出（直接从第一行开始输出，不要有任何前言、引言、英文说明）：
 
 📰 全球商业日报 | {today}
 
@@ -115,7 +148,8 @@ def get_daily_news():
    - 每条新闻都必须标注来源媒体名称（如：Reuters、Bloomberg、Financial Times等），不能只放链接，必须写出媒体名
    - 来源不明或无法确认的新闻不要使用
    - 全文不要出现"AI"这个词，你就是一位人类编辑
-   - 全文不要使用任何Markdown格式符号，不要用星号加粗，不要用井号标题，输出纯文本"""
+   - 全文不要使用任何Markdown格式符号，不要用星号加粗，不要用井号标题，输出纯文本
+   - 直接输出正文内容，第一行就是"📰 全球商业日报"，前面不要有任何英文引用、搜索说明或来源列表"""
 
     try:
         print("正在通过 Poe API 调用 Web-Search...")
@@ -138,6 +172,92 @@ def get_daily_news():
                 extra_body={"web_search": True},
             )
             result = response.choices[0].message.content
+            print("备用方案成功！")
+            return result
+        except Exception as e2:
+            print(f"备用方案也失败: {e2}")
+            return None
+
+
+def get_market_briefing():
+    """生成全球市场行情简报：股市 + 贵金属 + 稀土"""
+    beijing_tz = timezone(timedelta(hours=8))
+    today = datetime.now(beijing_tz).strftime("%Y年%m月%d日")
+
+    prompt = f"""今天是 {today}。
+
+你是一位专业的全球金融市场编辑。请联网搜索最新的全球市场数据，然后生成一份简洁的行情简报。
+
+搜索要求：
+- 搜索关键词包括：world stock markets today, gold silver copper price, rare earth prices, S&P 500, Nasdaq, Dow Jones, FTSE, DAX, Nikkei 225, Hang Seng, Shanghai Composite, ASX 200 等
+- 同时搜索：今日A股、恒生指数、黄金价格、白银价格、铜价、稀土价格
+- 优先使用 Bloomberg、Reuters、CNBC、MarketWatch、Investing.com、金十数据 等金融数据源
+
+请严格按以下格式输出（第一行直接开始，不要任何前言或英文说明）：
+
+💹 全球市场简报 | {today}
+
+📈 全球股市
+
+🇺🇸 美股
+标普500：[点位] [涨跌幅%]
+纳斯达克：[点位] [涨跌幅%]
+道琼斯：[点位] [涨跌幅%]
+
+🇨🇳 A股
+上证综指：[点位] [涨跌幅%]
+深证成指：[点位] [涨跌幅%]
+创业板指：[点位] [涨跌幅%]
+
+🇭🇰 港股
+恒生指数：[点位] [涨跌幅%]
+恒生科技：[点位] [涨跌幅%]
+
+🇯🇵 日本
+日经225：[点位] [涨跌幅%]
+
+🇬🇧🇪🇺 欧洲
+富时100：[点位] [涨跌幅%]
+德国DAX：[点位] [涨跌幅%]
+法国CAC40：[点位] [涨跌幅%]
+
+🇦🇺 澳洲
+ASX 200：[点位] [涨跌幅%]
+
+🪙 贵金属 & 大宗商品
+
+黄金（XAUUSD）：[价格] 美元/盎司 [涨跌幅%]
+白银（XAGUSD）：[价格] 美元/盎司 [涨跌幅%]
+铜（COMEX）：[价格] 美元/磅 [涨跌幅%]
+原油（WTI）：[价格] 美元/桶 [涨跌幅%]
+原油（布伦特）：[价格] 美元/桶 [涨跌幅%]
+
+🔋 稀土 & 关键矿产
+
+[列出主要稀土品种的最新价格动态，如氧化镨钕、氧化镝、氧化铽等。如果搜不到实时价格，说明最近的价格趋势即可]
+
+📝 一句话点评
+[一句话概括今天全球市场的整体情绪和驱动因素]
+
+重要规则：
+- 所有数据必须是最新的，标注是收盘价还是盘中价
+- 涨用 📗 或 +，跌用 📕 或 -（或直接用正负号）
+- 如果某个市场当天未开盘或休市，注明"休市"
+- 全部用中文（专有名词和代码除外）
+- 不要使用任何Markdown格式符号，不要用星号加粗，不要用井号标题，输出纯文本
+- 不要出现"AI"这个词
+- 直接输出正文，第一行就是"💹 全球市场简报"，前面不要有任何英文"""
+
+    try:
+        print("正在获取全球市场行情数据...")
+        result = call_poe("Web-Search", [{"role": "user", "content": prompt}])
+        print("市场简报生成完成！")
+        return result
+    except Exception as e:
+        print(f"市场简报生成失败: {e}")
+        try:
+            print("尝试备用方案获取市场数据...")
+            result = call_poe("Gemini-2.0-Flash", [{"role": "user", "content": prompt}])
             print("备用方案成功！")
             return result
         except Exception as e2:
@@ -248,33 +368,49 @@ def send_telegram(text):
 def main():
     print("开始执行每日全球商业新闻任务...")
 
-    # 第一步：生成完整日报
+    # ========== 第一步：生成完整日报 ==========
     daily_news = get_daily_news()
 
     if daily_news:
-        # 清理掉 Markdown 加粗符号
         daily_news = clean_text(daily_news)
+        daily_news = strip_english_preamble(daily_news)
 
-        # 发送第一条：完整日报
         print("发送第一条：完整日报...")
         send_telegram(daily_news)
+    else:
+        send_telegram("⚠️ 今天新闻获取失败，请检查 Poe API。")
+        print("日报获取失败")
 
-        # 第二步：基于日报生成微信群精简版
+    # ========== 第二步：生成市场行情简报 ==========
+    time.sleep(5)
+    market_briefing = get_market_briefing()
+
+    if market_briefing:
+        market_briefing = clean_text(market_briefing)
+        market_briefing = strip_english_preamble(market_briefing)
+
+        print("发送第二条：全球市场简报...")
+        send_telegram(market_briefing)
+    else:
+        send_telegram("⚠️ 全球市场简报生成失败")
+
+    # ========== 第三步：生成微信群精简版 ==========
+    if daily_news:
         time.sleep(5)
         group_brief = generate_wechat_group_brief(daily_news)
 
         if group_brief:
             group_brief = clean_text(group_brief)
-            # 发送第二条：微信群精简版
-            print("发送第二条：微信群精简版...")
+            group_brief = strip_english_preamble(group_brief)
+
+            print("发送第三条：微信群精简版...")
             header = "👇 以下是微信群发送版，可直接复制：\n\n"
             send_telegram(header + group_brief)
-            print("两条消息全部发送完成！")
+            print("三条消息全部发送完成！✅")
         else:
             send_telegram("⚠️ 微信群精简版生成失败")
-    else:
-        send_telegram("⚠️ 今天新闻获取失败，请检查 Poe API。")
-        print("任务失败")
+
+    print("今日任务执行结束。")
 
 
 if __name__ == "__main__":
