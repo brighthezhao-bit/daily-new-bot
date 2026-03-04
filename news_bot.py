@@ -10,7 +10,7 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 
 
-def call_poe(model, messages):
+def call_poe(model, messages, temperature=0.3):
     client = openai.OpenAI(
         api_key=POE_API_KEY,
         base_url="https://api.poe.com/v1",
@@ -19,91 +19,358 @@ def call_poe(model, messages):
         model=model,
         messages=messages,
         stream=False,
-        temperature=0.3,
+        temperature=temperature,
     )
     return response.choices[0].message.content
 
 
 def clean_text(text):
-    """去掉 Markdown 的加粗符号 **"""
-    return text.replace("**", "")
+    """去掉 Markdown 格式符号"""
+    text = text.replace("**", "")
+    text = re.sub(r'^#{1,3}\s+', '', text, flags=re.MULTILINE)
+    return text
 
 
 def strip_english_preamble(text):
-    """
-    去掉 Web-Search 模型返回的英文前缀垃圾。
-    策略：找到正文真正开始的标志性 emoji 或中文内容，把前面的全砍掉。
-    """
-    markers = ["📰", "📊", "🔥", "💹", "🌍", "🌐"]
+    markers = ["📰", "📊", "🔥", "💹", "🌍", "🌐", "☀️", "📋"]
     earliest_pos = len(text)
-
     for marker in markers:
         pos = text.find(marker)
         if pos != -1 and pos < earliest_pos:
             earliest_pos = pos
-
     if earliest_pos < len(text) and earliest_pos > 0:
         stripped = text[earliest_pos:]
         print(f"已清理前缀（去掉了前 {earliest_pos} 个字符）")
         return stripped
-
     lines = text.split("\n")
     for i, line in enumerate(lines):
         if re.search(r'[\u4e00-\u9fff]', line) and len(line.strip()) > 5:
             result = "\n".join(lines[i:])
             print(f"已通过中文检测清理前缀（跳过了前 {i} 行）")
             return result
-
     return text
 
 
-def get_daily_news():
+# ==============================================================
+#  语言风格指南（第1条和第2条共用）
+# ==============================================================
+
+STYLE_GUIDE = """
+你的语言风格指南（非常重要，必须严格遵守）：
+
+称呼规则（每次提到这些地方都必须用昵称，不要用正式名称）：
+- 美国 → 老美
+- 中国 → 东大
+- 日本 → 脚盆鸡 或 小日子
+- 澳大利亚 → 土澳
+- 欧洲 → 欧洲老钱
+- 中东国家 → 中东土豪
+- 韩国 → 思密达
+- 印度 → 三哥
+
+语气和风格：
+- 像一个消息灵通又幽默的朋友在群里跟大家聊昨晚发生了啥
+- 适当用互联网用语，比如"整活""上大分""绷不住""属于是""格局打开""闷声发大财""拿捏了"
+- 可以用歇后语或俏皮比喻来点睛
+- 数据要准确，但表达要口语化，不要书面腔
+- 开头要抓人，先讲结论或最劲爆的点
+- 保持克制——重要的地方正经说，轻松的地方皮一下，不要每句都加梗
+- 绝对不要用"小伙伴们""家人们""宝子们"这类油腻称呼
+- 不要用"震惊""重磅""突发"这类标题党词汇
+
+示例句子（感受一下调性，不要照抄）：
+- "老美昨晚又整活了，标普跌了1.3%，导火索是非农数据炸了锅。"
+- "东大这边稳得一批，上证微涨0.2%，新能源板块继续上大分。"
+- "脚盆鸡的日经225跟着吃瓜跌了0.8%，日元又软了。"
+- "土澳矿老板们今天心情不太好，铁矿石价格又往下走了。"
+- "说白了，现在全球就是在等老美那边利率到底降不降，其他都是噪音。"
+- "思密达那边三星又放大招了，这次是真有东西还是PPT先行，再看看。"
+- "东大这波闷声干大事，等欧洲老钱反应过来黄花菜都凉了。"
+"""
+
+
+# ==============================================================
+#  第一道：Web-Search 搜索原始素材（两个函数，各搜各的）
+# ==============================================================
+
+def fetch_raw_market():
+    """第一道：搜索全球市场数据，输出纯事实素材"""
     beijing_tz = timezone(timedelta(hours=8))
     today = datetime.now(beijing_tz).strftime("%Y年%m月%d日")
 
     prompt = f"""今天是 {today}。
 
-你是一位顶尖的全球商业资讯编辑。你的读者是关注全球商业动态的中文读者。
+请联网搜索过去24小时内全球金融市场的最新数据和重要新闻。
 
-请你联网搜索今天全球各地最新的商业新闻，然后完成以下工作：
+搜索关键词（英文和中文都要搜）：
+英文：world stock markets today, S&P 500, Nasdaq, Dow Jones, FTSE 100, DAX, Nikkei 225, Hang Seng, Shanghai Composite, ASX 200, gold price today, silver price, oil price WTI Brent, Fed interest rate, ECB, market news today
+中文：今日A股, 恒生指数, 黄金价格, 原油价格, 央行政策
 
-1. 搜索范围要覆盖：北美、欧洲、中国、东亚（日韩）、东南亚、南亚（印度）、澳大利亚、中东、非洲、拉美。
+优先来源：Bloomberg, Reuters, CNBC, MarketWatch, Financial Times, Investing.com, Nikkei Asia, 金十数据, 华尔街见闻
 
-2. 信息来源要求（非常重要）：
-   - 必须优先搜索国际主流英文媒体，包括但不限于：Reuters、Bloomberg、Financial Times、The Wall Street Journal、CNBC、TechCrunch、The Verge、Nikkei Asia、The Economist、MIT Technology Review、South China Morning Post、Al Jazeera、BBC Business 等
-   - 至少一半以上的信息源必须来自英文媒体
-   - 中文媒体（如财新、第一财经、36氪等）可以作为补充，但不能是唯一来源
-   - 每条新闻都必须标注来源媒体的英文或中文名称
-   - 搜索时请同时使用英文关键词搜索，不要只用中文关键词
+请输出一份纯事实的原始素材汇总，包含：
 
-3. 筛选标准（只挑真正有价值的）：
-   - 各国重大经济政策变动（关税、监管、利率等）
-   - 新兴市场的商业机会
-   - 全球巨头的重要动作（收购、扩张、裁员、新业务）
-   - 跨境电商 / 出海相关动态
-   - 科技商业化的重大突破
-   - 消费趋势变化
-   - 中文互联网很少报道但其实很重要的事
+1. 各主要股票市场最新数据（标普500、纳斯达克、道琼斯、上证、深证、创业板、恒生、恒生科技、日经225、富时100、DAX、ASX 200）——写出具体点位和涨跌幅百分比
 
-4. 严格按以下格式输出（直接从第一行开始输出，不要有任何前言、引言、英文说明）：
+2. 大宗商品价格（黄金、白银、WTI原油、布伦特原油）——写出具体价格和涨跌幅
 
-📰 全球商业日报 | {today}
+3. 过去24小时市场的重要事件和驱动因素（央行政策、经济数据、地缘政治、公司财报等），每条标注来源媒体
 
-🔥 今日最值得关注的3件事
+4. 今天即将发生的重要事项（数据公布、央行决议、重要会议等），标注来源
 
-1️⃣ [标题]
-[2-3句话说清发生了什么、为什么重要。标注信息来源]
+5. 如果某市场休市，注明
 
-2️⃣ [标题]
-[2-3句话说清发生了什么、为什么重要。标注信息来源]
+规则：
+- 全部中文输出（专有名词除外）
+- 每条信息标注来源媒体名称
+- 数据要具体准确，不要模糊
+- 不需要文学加工，纯事实数据罗列
+- 不要使用Markdown格式
+- 直接输出内容，不要英文前言"""
 
-3️⃣ [标题]
-[2-3句话说清发生了什么、为什么重要。标注信息来源]
+    try:
+        print("第一道：正在搜索全球市场数据...")
+        result = call_poe("Web-Search", [{"role": "user", "content": prompt}])
+        print("市场原始素材获取完成！")
+        return result
+    except Exception as e:
+        print(f"市场数据搜索失败: {e}")
+        return None
 
-📊 分区速览
+
+def fetch_raw_news():
+    """第一道：搜索全球商业新闻，输出纯事实素材"""
+    beijing_tz = timezone(timedelta(hours=8))
+    today = datetime.now(beijing_tz).strftime("%Y年%m月%d日")
+
+    prompt = f"""今天是 {today}。
+
+请联网搜索过去24小时内全球各地最重要的商业新闻。
+
+搜索范围：北美、欧洲、中国、日本、韩国、东南亚、印度、澳大利亚、中东、非洲、拉美。
+
+搜索关键词（英文和中文都要搜）：
+英文：business news today, tech news, trade policy, tariff, M&A, startup funding, global economy, OPEC, semiconductor, EV market, AI chips, cross-border ecommerce
+中文：今日商业新闻, 科技动态, 跨境电商, 出海, 关税, 监管政策
+
+优先来源：Reuters, Bloomberg, Financial Times, Wall Street Journal, CNBC, TechCrunch, The Verge, Nikkei Asia, South China Morning Post, Al Jazeera, BBC Business, 财新, 第一财经, 36氪
+
+筛选标准：
+- 各国重大经济政策变动（关税、监管、利率等）
+- 新兴市场商业机会
+- 全球巨头重要动作（收购、扩张、裁员、新业务）
+- 跨境电商/出海动态
+- 科技商业化重大突破
+- 消费趋势变化
+- 中文互联网很少报道但其实很重要的事
+
+输出要求：
+- 按地区分类列出所有搜集到的新闻
+- 每条写清楚：发生了什么、涉及哪些公司/政策/人物、为什么重要
+- 每条标注来源媒体名称
+- 全部中文（专有名词除外）
+- 纯事实罗列，不需要文学加工
+- 不要使用Markdown格式
+- 直接输出内容，不要英文前言
+- 只报道过去24小时的新闻"""
+
+    try:
+        print("第一道：正在搜索全球商业新闻...")
+        result = call_poe("Web-Search", [{"role": "user", "content": prompt}])
+        print("商业新闻原始素材获取完成！")
+        return result
+    except Exception as e:
+        print(f"商业新闻搜索失败: {e}")
+        return None
+
+
+# ==============================================================
+#  第二道：改写加工（四个函数，两个有人味，两个正经）
+# ==============================================================
+
+def rewrite_market_story(raw_market):
+    """第二道·第1条：有人味的市场故事"""
+    beijing_tz = timezone(timedelta(hours=8))
+    today = datetime.now(beijing_tz).strftime("%Y年%m月%d日")
+
+    prompt = f"""你是「奇怪地球咨询社」的主编，每天早上给读者讲昨晚全球市场发生了什么。读者刚睡醒，你要用最快的方式让他们知道昨晚世界怎么了。
+
+{STYLE_GUIDE}
+
+以下是今天的市场原始数据和新闻素材（由搜索引擎采集，可能格式粗糙，你需要从中提取关键信息）：
+
+===素材开始===
+{raw_market}
+===素材结束===
+
+请基于以上素材，写一条早间市场速报。格式严格如下：
+
+☀️ 早上好 市场速报 | {today}
+
+[用2-3段话讲清楚昨晚到今早全球市场的核心故事。每段聚焦一个主题（比如老美那边、东大和亚太、大宗商品等）。先讲发生了什么和为什么，再自然带入涨跌数据。段落之间空一行。每段末尾括号标注来源。]
+
+👀 今天盯这几个
+1️⃣ [一句话，今天第一个值得关注的事]
+2️⃣ [一句话，第二个]
+3️⃣ [一句话，第三个（如果有的话）]
+
+💬 奇怪地球点评：[1-2句话，带态度的前瞻判断，不是总结上面说过的，而是你的观点。口语化。]
+
+——
+奇怪地球咨询社 | 抹平全球商业的信息差
+
+写作规则：
+- 整条消息正文控制在250-350字，宁短勿长
+- 来源用括号简单标注，如（据Bloomberg）
+- 不要使用任何Markdown格式符号，纯文本
+- 不要出现"AI"这个词
+- 数据必须来自素材，不要编造
+- 第一行直接输出"☀️"开头，前面不要有任何内容
+- 某市场休市或没啥可说的就跳过
+- 点评那句话要有自己的态度，可以皮一点"""
+
+    try:
+        print("第二道：正在改写市场故事（有人味版）...")
+        result = call_poe("Claude-3.5-Sonnet", [{"role": "user", "content": prompt}], temperature=0.7)
+        print("第1条 市场故事 ✅")
+        return result
+    except Exception as e:
+        print(f"Claude失败，尝试GPT-4o: {e}")
+        try:
+            result = call_poe("GPT-4o", [{"role": "user", "content": prompt}], temperature=0.7)
+            return result
+        except Exception as e2:
+            print(f"全部失败: {e2}")
+            return None
+
+
+def rewrite_business_highlights(raw_news):
+    """第二道·第2条：有人味的商业重点事件"""
+    beijing_tz = timezone(timedelta(hours=8))
+    today = datetime.now(beijing_tz).strftime("%Y年%m月%d日")
+
+    prompt = f"""你是「奇怪地球咨询社」的主编，每天早上告诉读者今天最值得知道的几件商业大事。
+
+{STYLE_GUIDE}
+
+以下是今天搜集到的全球商业新闻原始素材（由搜索引擎采集，可能格式粗糙）：
+
+===素材开始===
+{raw_news}
+===素材结束===
+
+请从中挑出最重要的3件事（特别重大可以2件或4件，绝不超过4件），写一条早间商业快报。格式严格如下：
+
+📰 今天商业圈这几件事 | {today}
+
+1️⃣ [一个有意思的短标题，比如"老美又对东大出手了"而不是"美国对华关税政策调整"]
+[2-3句话说清发生了什么、为什么重要。括号标注来源。语气口语化但信息准确。]
+
+2️⃣ [短标题]
+[2-3句话。标注来源。]
+
+3️⃣ [短标题]
+[2-3句话。标注来源。]
+
+💬 奇怪地球点评：[1-2句话，带态度的总结判断。不是复述上面的内容，而是你对今天全球商业整体风向的一个判断。口语化，可以皮一点。]
+
+——
+奇怪地球咨询社 | 抹平全球商业的信息差
+
+写作规则：
+- 整条消息控制在300-450字
+- 标题要有意思，要用昵称（老美、东大、脚盆鸡等）
+- 每条新闻的展开要口语化但准确
+- 来源括号简单标注
+- 不要使用任何Markdown格式符号，纯文本
+- 不要出现"AI"这个词
+- 信息必须来自素材，不要编造
+- 第一行直接输出"📰"开头"""
+
+    try:
+        print("第二道：正在改写商业重点（有人味版）...")
+        result = call_poe("Claude-3.5-Sonnet", [{"role": "user", "content": prompt}], temperature=0.7)
+        print("第2条 商业重点 ✅")
+        return result
+    except Exception as e:
+        print(f"Claude失败，尝试GPT-4o: {e}")
+        try:
+            result = call_poe("GPT-4o", [{"role": "user", "content": prompt}], temperature=0.7)
+            return result
+        except Exception as e2:
+            print(f"全部失败: {e2}")
+            return None
+
+
+def format_data_dashboard(raw_market):
+    """第二道·第3条：正经的数据速查表"""
+    beijing_tz = timezone(timedelta(hours=8))
+    today = datetime.now(beijing_tz).strftime("%Y年%m月%d日")
+
+    prompt = f"""以下是今天的全球市场原始数据素材：
+
+===素材开始===
+{raw_market}
+===素材结束===
+
+请从中提取核心数据，整理为一份紧凑的数据速查表。格式严格如下：
+
+📋 数据速查 | {today}
+
+美股：标普500 [点位]（[涨跌幅%]）｜纳斯达克 [点位]（[涨跌幅%]）｜道琼斯 [点位]（[涨跌幅%]）
+A股：上证 [点位]（[涨跌幅%]）｜深证 [点位]（[涨跌幅%]）｜创业板 [点位]（[涨跌幅%]）
+港股：恒生 [点位]（[涨跌幅%]）｜恒生科技 [点位]（[涨跌幅%]）
+日本：日经225 [点位]（[涨跌幅%]）
+欧洲：富时100 [点位]（[涨跌幅%]）｜DAX [点位]（[涨跌幅%]）
+澳洲：ASX 200 [点位]（[涨跌幅%]）
+黄金：[价格]美元/盎司（[涨跌幅%]）｜白银：[价格]美元/盎司（[涨跌幅%]）
+原油：WTI [价格]美元/桶（[涨跌幅%]）｜布伦特 [价格]美元/桶（[涨跌幅%]）
+
+数据截至：[标注是昨日收盘还是今日盘中]
+
+——
+奇怪地球咨询社 | 抹平全球商业的信息差
+
+规则：
+- 只输出数据，不要任何叙事、评论或解读
+- 某市场休市标注"休市"
+- 素材中找不到的数据标注"暂无数据"，绝不编造
+- 每类市场一行，格式紧凑
+- 不要使用Markdown格式
+- 第一行直接输出"📋"开头"""
+
+    try:
+        print("第二道：正在整理数据速查表（正经版）...")
+        result = call_poe("Claude-3.5-Sonnet", [{"role": "user", "content": prompt}], temperature=0.1)
+        print("第3条 数据速查 ✅")
+        return result
+    except Exception as e:
+        print(f"Claude失败，尝试GPT-4o: {e}")
+        try:
+            result = call_poe("GPT-4o", [{"role": "user", "content": prompt}], temperature=0.1)
+            return result
+        except Exception as e2:
+            print(f"全部失败: {e2}")
+            return None
+
+
+def format_regional_details(raw_news):
+    """第二道·第4条：正经的分区速览"""
+    beijing_tz = timezone(timedelta(hours=8))
+    today = datetime.now(beijing_tz).strftime("%Y年%m月%d日")
+
+    prompt = f"""以下是今天搜集到的全球商业新闻原始素材：
+
+===素材开始===
+{raw_news}
+===素材结束===
+
+请按地区整理成一份分区商业速览。格式严格如下：
+
+🌐 分区速览 | {today}
 
 🇺🇸 北美
-[1-2条核心动态，每条1-2句，标注来源]
+[1-2条核心动态，每条1-2句，标注来源媒体名]
 
 🇪🇺 欧洲
 [同上]
@@ -111,7 +378,7 @@ def get_daily_news():
 🇨🇳 中国
 [同上]
 
-🇯🇵🇰🇷 东亚（日韩等）
+🇯🇵🇰🇷 日韩
 [同上]
 
 🌏 东南亚
@@ -132,211 +399,93 @@ def get_daily_news():
 🌎 拉美
 [同上]
 
-💡 奇怪地球点评
-[一段话总结今天全球商业的整体风向，指出值得持续关注的趋势]
-
 ——
 奇怪地球咨询社 | 抹平全球商业的信息差
 
-5. 重要规则：
-   - 只报道过去24小时内的新闻，严禁使用超过1天的旧闻，如果无法确认是24小时内的，宁可不报道
-   - 如果某个地区今天没有值得报道的新闻，直接跳过该地区
-   - 全部用中文
-   - 简洁有力，不要废话套话
-   - 保持客观中立
-   - 每条新闻都必须标注来源媒体名称（如：Reuters、Bloomberg、Financial Times等），不能只放链接，必须写出媒体名
-   - 来源不明或无法确认的新闻不要使用
-   - 全文不要出现"AI"这个词，你就是一位人类编辑
-   - 全文不要使用任何Markdown格式符号，不要用星号加粗，不要用井号标题，输出纯文本
-   - 直接输出正文内容，第一行就是"📰 全球商业日报"，前面不要有任何英文引用、搜索说明或来源列表
-   - 最后一行必须是"奇怪地球咨询社 | 抹平全球商业的信息差"作为签名档"""
+规则：
+- 正经、客观、简洁的语气，不需要口语化或昵称
+- 每条标注来源媒体名称
+- 如果某地区在素材中没有值得报道的新闻，直接跳过该地区，不要写"暂无"
+- 信息必须来自素材，不要编造
+- 不要使用Markdown格式
+- 第一行直接输出"🌐"开头"""
 
     try:
-        print("正在通过 Poe API 调用 Web-Search...")
-        result = call_poe("Web-Search", [{"role": "user", "content": prompt}])
-        print("日报整理完成！")
+        print("第二道：正在整理分区速览（正经版）...")
+        result = call_poe("Claude-3.5-Sonnet", [{"role": "user", "content": prompt}], temperature=0.2)
+        print("第4条 分区速览 ✅")
         return result
     except Exception as e:
-        print(f"Web-Search 失败: {e}")
+        print(f"Claude失败，尝试GPT-4o: {e}")
         try:
-            print("尝试备用方案...")
-            client = openai.OpenAI(
-                api_key=POE_API_KEY,
-                base_url="https://api.poe.com/v1",
-            )
-            response = client.chat.completions.create(
-                model="Gemini-2.0-Flash",
-                messages=[{"role": "user", "content": prompt}],
-                stream=False,
-                temperature=0.3,
-                extra_body={"web_search": True},
-            )
-            result = response.choices[0].message.content
-            print("备用方案成功！")
+            result = call_poe("GPT-4o", [{"role": "user", "content": prompt}], temperature=0.2)
             return result
         except Exception as e2:
-            print(f"备用方案也失败: {e2}")
+            print(f"全部失败: {e2}")
             return None
 
 
-def get_market_briefing():
-    """生成全球市场行情简报：叙事驱动 + 数据速查"""
+# ==============================================================
+#  微信群精简版（基于第1条+第2条生成）
+# ==============================================================
+
+def generate_wechat_brief(market_story, business_highlights):
+    """基于已经改写好的第1条和第2条，生成微信群超短版"""
     beijing_tz = timezone(timedelta(hours=8))
     today = datetime.now(beijing_tz).strftime("%Y年%m月%d日")
 
-    prompt = f"""今天是 {today}。
+    prompt = f"""你是「奇怪地球咨询社」的编辑，需要把今天的速报压缩成一条微信群消息。读者10秒看完就行。
 
-你是一位顶尖的全球金融市场编辑。你的读者不是专业交易员，而是对全球商业感兴趣的普通人。他们不缺数据，缺的是有人帮他们理解"发生了什么、为什么、跟我有什么关系"。
+以下是今天已写好的两条速报：
 
-请联网搜索最新的全球市场数据和财经新闻，生成一份叙事驱动的市场简报。
+【市场速报】
+{market_story}
 
-搜索要求：
-- 英文关键词：world stock markets today, gold silver copper price, S&P 500, Nasdaq, Dow Jones, FTSE, DAX, Nikkei 225, Hang Seng, Shanghai Composite, ASX 200, Fed interest rate, market news today, oil price, OPEC 等
-- 中文关键词：今日A股、恒生指数、黄金价格、原油价格、今日市场分析、央行政策、板块异动
-- 优先使用 Bloomberg、Reuters、CNBC、MarketWatch、Financial Times、Investing.com、Nikkei Asia、金十数据、华尔街见闻 等来源
+【商业速报】
+{business_highlights}
 
-请严格按以下格式和风格输出（第一行直接开始，不要任何前言或英文说明）：
+压缩为以下格式（严格遵守，不要多一个字）：
 
-💹 全球市场简报 | {today}
+☀️ 早报 | {today}
 
-🔥 昨夜今晨，发生了什么
+📈 [一句话总结昨晚市场，不超过25字]
 
-[用3-4段话，讲清楚过去24小时全球市场最核心的几条主线。每段聚焦一个主题，比如：美股表现及原因、亚太市场反应、大宗商品动态等。]
+📰 今天知道这几件事就够了：
+1️⃣ [不超过20字]
+2️⃣ [不超过20字]
+3️⃣ [不超过20字]
 
-写作要求：
-- 先讲故事和原因，再带数据。比如不要上来就列"标普500：5104"，而是说"美股昨夜全线收跌，标普跌1.3%，导火索是……"
-- 数据自然嵌入叙事中，不要单独罗列
-- 每段话要有因果逻辑：发生了什么 → 为什么 → 影响是什么
-- 每段末尾用括号标注来源媒体名，如（据Bloomberg、CNBC）
-- 如果某个市场休市，可以跳过或一句话带过
+💬 [一句话判断，不超过30字]
 
-🔍 今天盯什么
-
-[列出2-3个今天值得关注的事项，每条用1️⃣2️⃣3️⃣编号，每条1-2句话。比如：即将公布的经济数据、央行决议、重要公司财报、政策动向等。每条标注来源媒体名。]
-
-📋 数据速查
-
-[用紧凑的单行格式列出核心数据，方便快速查阅，格式如下：]
-美股：标普500 [点位]（[涨跌幅%]）｜纳斯达克 [点位]（[涨跌幅%]）｜道琼斯 [点位]（[涨跌幅%]）
-A股：上证 [点位]（[涨跌幅%]）｜深证 [点位]（[涨跌幅%]）｜创业板 [点位]（[涨跌幅%]）
-港股：恒生 [点位]（[涨跌幅%]）｜恒生科技 [点位]（[涨跌幅%]）
-日本：日经225 [点位]（[涨跌幅%]）
-欧洲：富时100 [点位]（[涨跌幅%]）｜DAX [点位]（[涨跌幅%]）
-澳洲：ASX 200 [点位]（[涨跌幅%]）
-黄金：[价格]美元/盎司（[涨跌幅%]）｜白银：[价格]美元/盎司（[涨跌幅%]）
-原油：WTI [价格]美元/桶（[涨跌幅%]）｜布伦特 [价格]美元/桶（[涨跌幅%]）
-
-[如果某市场休市，在对应位置标注"休市"]
-[标注数据是收盘价还是盘中实时价]
-
-📝 奇怪地球点评
-[2-3句话，用专业但易懂的语言做一个带态度的判断。不是总结前面说过的话，而是给读者一个前瞻性的观点：短期该警惕什么、期待什么、别被什么带节奏。语气克制但有立场。]
+👉 完整版见今日公众号推文
 
 ——
 奇怪地球咨询社 | 抹平全球商业的信息差
 
-重要规则：
-- 这是一份叙事驱动的简报，不是数据报表。"昨夜今晨"部分必须是连贯的段落叙述，严禁用列表或逐条罗列的方式写
-- 数据速查部分放在最后，尽量紧凑，不要占太多篇幅
-- 只标注来源媒体名称（如：据Reuters、据Bloomberg），绝对不要附任何URL链接
-- 所有数据必须是最新的
-- 全部用中文（专有名词和代码除外）
-- 不要使用任何Markdown格式符号，不要用星号加粗，不要用井号标题，输出纯文本
-- 不要出现"AI"这个词，你就是一位人类编辑
-- 来源不明或无法确认的信息不要使用
-- 直接输出正文，第一行就是"💹 全球市场简报"，前面不要有任何英文
-- 如果某个商品或市场今天没有值得特别展开说的，在叙事部分可以跳过，数据速查里列上就行
-- 最后一行必须是"奇怪地球咨询社 | 抹平全球商业的信息差"作为签名档"""
-
-    try:
-        print("正在获取全球市场行情数据...")
-        result = call_poe("Web-Search", [{"role": "user", "content": prompt}])
-        print("市场简报生成完成！")
-        return result
-    except Exception as e:
-        print(f"市场简报生成失败: {e}")
-        try:
-            print("尝试备用方案获取市场数据...")
-            result = call_poe("Gemini-2.0-Flash", [{"role": "user", "content": prompt}])
-            print("备用方案成功！")
-            return result
-        except Exception as e2:
-            print(f"备用方案也失败: {e2}")
-            return None
-
-
-def generate_wechat_group_brief(daily_news):
-    beijing_tz = timezone(timedelta(hours=8))
-    today = datetime.now(beijing_tz).strftime("%Y年%m月%d日")
-
-    prompt = f"""你是一位内容编辑助手，负责将每日完整版全球商业简报压缩为适合微信粉丝群发送的精简版。
-
-# 目标
-将以下完整版简报转化为一条可以直接复制粘贴到微信群的短消息，让读者在10秒内抓住今天的核心信息，同时引导他们去公众号看完整版。
-
-# 完整版简报原文：
-{daily_news}
-
-# 输出格式（严格按以下结构，不要多一个字）
-
-📰 今日X件事 | {today}
-
-[用1️⃣2️⃣3️⃣编号，每条一行]
-
-💬 奇怪地球点评：[一句话判断]
-
-👉 完整解读 + 分区速览，见今天公众号推文
-
-——
-奇怪地球咨询社 | 抹平全球商业的信息差
-
-# 写作规则
-
-## 核心提炼
-- 只保留完整版中「今日最值得关注的X件事」，数量跟随原文（可能是2-5条）
-- 每条新闻压缩为1行，不超过30个字
-- 用大白话写，不要书面语，就像你在群里跟朋友说今天发生了什么
-- 如果原文某条新闻涉及多个细节，只保留最核心的一个点
-
-## 风向句
-- 从完整版的「今日风向」或「奇怪地球点评」中提炼出一句话，不超过35个字
-- 要有态度、有判断，不要写成新闻摘要
-- 可以带一点口语化的表达，比如"说白了""盯紧""别急"
-
-## 禁止事项
-- 不要出现信源标注（Reuters、Bloomberg等）
-- 不要出现分区速览的任何内容（那是公众号引流的钩子）
-- 不要出现任何解释性文字，只给结论
-- 不要加任何开场白或结尾寒暄
-- 不要使用加粗、斜体等任何Markdown格式符号（微信群不支持）
-- 每条新闻不要换行展开，必须控制在一行内
-- 不要输出任何多余的话，只输出最终的精简版消息本身
-
-## 语气
-- 像一个消息灵通的朋友在群里给大家划重点
-- 克制但有态度，不夸张不标题党
-- 中文为主，专有名词可保留英文缩写（如OPEC+、PPI）"""
+规则：
+- 总字数150字以内
+- 不要出现来源标注
+- 语气口语化，像朋友划重点
+- 不要Markdown格式
+- 直接输出，不要多余的话
+- 第一行直接输出"☀️"开头"""
 
     try:
         print("正在生成微信群精简版...")
-        result = call_poe("Claude-3.5-Sonnet", [{"role": "user", "content": prompt}])
-        print("微信群精简版生成完成！")
+        result = call_poe("Claude-3.5-Sonnet", [{"role": "user", "content": prompt}], temperature=0.5)
+        print("微信群精简版 ✅")
         return result
     except Exception as e:
-        print(f"微信群精简版生成失败: {e}")
-        try:
-            print("尝试备用模型...")
-            result = call_poe("GPT-4o", [{"role": "user", "content": prompt}])
-            print("备用模型成功！")
-            return result
-        except Exception as e2:
-            print(f"备用模型也失败: {e2}")
-            return None
+        print(f"微信群精简版失败: {e}")
+        return None
 
+
+# ==============================================================
+#  发送
+# ==============================================================
 
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
     chunks = []
     if len(text) > 4096:
         while len(text) > 0:
@@ -368,52 +517,102 @@ def send_telegram(text):
             print(f"发送出错: {e}")
 
 
+# ==============================================================
+#  主流程
+# ==============================================================
+
 def main():
-    print("开始执行每日全球商业新闻任务...")
+    print("=" * 50)
+    print("奇怪地球咨询社 · 每日简报任务启动")
+    print("流程：第一道搜索 → 第二道改写 → 发送4+1条")
+    print("=" * 50)
 
-    # ========== 第一步：生成完整日报 ==========
-    daily_news = get_daily_news()
+    # ========== 第一道：搜索原始素材（2次API调用） ==========
+    print("\n--- 第一道：搜索原始素材 ---")
 
-    if daily_news:
-        daily_news = clean_text(daily_news)
-        daily_news = strip_english_preamble(daily_news)
-
-        print("发送第一条：完整日报...")
-        send_telegram(daily_news)
-    else:
-        send_telegram("⚠️ 今天新闻获取失败，请检查 Poe API。")
-        print("日报获取失败")
-
-    # ========== 第二步：生成市场行情简报 ==========
+    raw_market = fetch_raw_market()
     time.sleep(5)
-    market_briefing = get_market_briefing()
+    raw_news = fetch_raw_news()
 
-    if market_briefing:
-        market_briefing = clean_text(market_briefing)
-        market_briefing = strip_english_preamble(market_briefing)
+    if not raw_market and not raw_news:
+        send_telegram("⚠️ 今天数据获取全部失败，请检查 Poe API。")
+        return
 
-        print("发送第二条：全球市场简报...")
-        send_telegram(market_briefing)
+    # 清理原始素材
+    if raw_market:
+        raw_market = clean_text(strip_english_preamble(raw_market))
+    if raw_news:
+        raw_news = clean_text(strip_english_preamble(raw_news))
+
+    # ========== 第二道：改写加工（4次API调用） ==========
+    print("\n--- 第二道：改写加工 ---")
+
+    msg1 = None  # 市场故事（有人味）→ 第1条发送
+    msg2 = None  # 商业重点（有人味）→ 第2条发送
+    msg3 = None  # 数据速查（正经）  → 第3条发送
+    msg4 = None  # 分区速览（正经）  → 第4条发送
+
+    if raw_market:
+        msg1 = rewrite_market_story(raw_market)
+        time.sleep(3)
+        msg3 = format_data_dashboard(raw_market)
+        time.sleep(3)
+
+    if raw_news:
+        msg2 = rewrite_business_highlights(raw_news)
+        time.sleep(3)
+        msg4 = format_regional_details(raw_news)
+        time.sleep(3)
+
+    # ========== 发送4条消息（浅→浅→深→深） ==========
+    print("\n--- 开始发送 ---")
+
+    if msg1:
+        msg1 = clean_text(strip_english_preamble(msg1))
+        print("发送第1条：☀️ 市场故事")
+        send_telegram(msg1)
+        time.sleep(2)
     else:
-        send_telegram("⚠️ 全球市场简报生成失败")
+        send_telegram("⚠️ 今日市场速报生成失败")
 
-    # ========== 第三步：生成微信群精简版 ==========
-    if daily_news:
-        time.sleep(5)
-        group_brief = generate_wechat_group_brief(daily_news)
+    if msg2:
+        msg2 = clean_text(strip_english_preamble(msg2))
+        print("发送第2条：📰 商业重点")
+        send_telegram(msg2)
+        time.sleep(2)
+    else:
+        send_telegram("⚠️ 今日商业速报生成失败")
 
-        if group_brief:
-            group_brief = clean_text(group_brief)
-            group_brief = strip_english_preamble(group_brief)
+    if msg3:
+        msg3 = clean_text(strip_english_preamble(msg3))
+        print("发送第3条：📋 数据速查")
+        send_telegram(msg3)
+        time.sleep(2)
+    else:
+        send_telegram("⚠️ 数据速查生成失败")
 
-            print("发送第三条：微信群精简版...")
+    if msg4:
+        msg4 = clean_text(strip_english_preamble(msg4))
+        print("发送第4条：🌐 分区速览")
+        send_telegram(msg4)
+        time.sleep(2)
+    else:
+        send_telegram("⚠️ 分区速览生成失败")
+
+    # ========== 第5条：微信群精简版 ==========
+    if msg1 and msg2:
+        time.sleep(3)
+        wechat_brief = generate_wechat_brief(msg1, msg2)
+        if wechat_brief:
+            wechat_brief = clean_text(strip_english_preamble(wechat_brief))
+            print("发送第5条：微信群精简版")
             header = "👇 以下是微信群发送版，可直接复制：\n\n"
-            send_telegram(header + group_brief)
-            print("三条消息全部发送完成！✅")
-        else:
-            send_telegram("⚠️ 微信群精简版生成失败")
+            send_telegram(header + wechat_brief)
 
-    print("今日任务执行结束。")
+    print("\n" + "=" * 50)
+    print("今日任务全部完成 ✅")
+    print(f"共调用API：第一道2次搜索 + 第二道4次改写 + 1次微信版 = 7次")
+    print("=" * 50)
 
 
 if __name__ == "__main__":
