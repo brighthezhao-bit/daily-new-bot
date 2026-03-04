@@ -179,90 +179,6 @@ def get_daily_news():
             return None
 
 
-def get_market_briefing():
-    """生成全球市场行情简报：股市 + 贵金属 + 稀土"""
-    beijing_tz = timezone(timedelta(hours=8))
-    today = datetime.now(beijing_tz).strftime("%Y年%m月%d日")
-
-    prompt = f"""今天是 {today}。
-
-你是一位专业的全球金融市场编辑。请联网搜索最新的全球市场数据，然后生成一份简洁的行情简报。
-
-搜索要求：
-- 搜索关键词包括：world stock markets today, gold silver copper price, rare earth prices, S&P 500, Nasdaq, Dow Jones, FTSE, DAX, Nikkei 225, Hang Seng, Shanghai Composite, ASX 200 等
-- 同时搜索：今日A股、恒生指数、黄金价格、白银价格、铜价、稀土价格
-- 优先使用 Bloomberg、Reuters、CNBC、MarketWatch、Investing.com、金十数据 等金融数据源
-
-请严格按以下格式输出（第一行直接开始，不要任何前言或英文说明）：
-
-💹 全球市场简报 | {today}
-
-📈 全球股市
-
-🇺🇸 美股
-标普500：[点位] [涨跌幅%]
-纳斯达克：[点位] [涨跌幅%]
-道琼斯：[点位] [涨跌幅%]
-
-🇨🇳 A股
-上证综指：[点位] [涨跌幅%]
-深证成指：[点位] [涨跌幅%]
-创业板指：[点位] [涨跌幅%]
-
-🇭🇰 港股
-恒生指数：[点位] [涨跌幅%]
-恒生科技：[点位] [涨跌幅%]
-
-🇯🇵 日本
-日经225：[点位] [涨跌幅%]
-
-🇬🇧🇪🇺 欧洲
-富时100：[点位] [涨跌幅%]
-德国DAX：[点位] [涨跌幅%]
-法国CAC40：[点位] [涨跌幅%]
-
-🇦🇺 澳洲
-ASX 200：[点位] [涨跌幅%]
-
-🪙 贵金属 & 大宗商品
-
-黄金（XAUUSD）：[价格] 美元/盎司 [涨跌幅%]
-白银（XAGUSD）：[价格] 美元/盎司 [涨跌幅%]
-铜（COMEX）：[价格] 美元/磅 [涨跌幅%]
-原油（WTI）：[价格] 美元/桶 [涨跌幅%]
-原油（布伦特）：[价格] 美元/桶 [涨跌幅%]
-
-🔋 稀土 & 关键矿产
-
-[列出主要稀土品种的最新价格动态，如氧化镨钕、氧化镝、氧化铽等。如果搜不到实时价格，说明最近的价格趋势即可]
-
-📝 一句话点评
-[一句话概括今天全球市场的整体情绪和驱动因素]
-
-重要规则：
-- 所有数据必须是最新的，标注是收盘价还是盘中价
-- 涨用 📗 或 +，跌用 📕 或 -（或直接用正负号）
-- 如果某个市场当天未开盘或休市，注明"休市"
-- 全部用中文（专有名词和代码除外）
-- 不要使用任何Markdown格式符号，不要用星号加粗，不要用井号标题，输出纯文本
-- 不要出现"AI"这个词
-- 直接输出正文，第一行就是"💹 全球市场简报"，前面不要有任何英文"""
-
-    try:
-        print("正在获取全球市场行情数据...")
-        result = call_poe("Web-Search", [{"role": "user", "content": prompt}])
-        print("市场简报生成完成！")
-        return result
-    except Exception as e:
-        print(f"市场简报生成失败: {e}")
-        try:
-            print("尝试备用方案获取市场数据...")
-            result = call_poe("Gemini-2.0-Flash", [{"role": "user", "content": prompt}])
-            print("备用方案成功！")
-            return result
-        except Exception as e2:
-            print(f"备用方案也失败: {e2}")
-            return None
 
 
 def generate_wechat_group_brief(daily_news):
@@ -330,6 +246,105 @@ def generate_wechat_group_brief(daily_news):
             print(f"备用模型也失败: {e2}")
             return None
 
+def get_market_briefing():
+    """生成全球市场行情简报：股市 + 贵金属 + 稀土 + 新闻点评"""
+    beijing_tz = timezone(timedelta(hours=8))
+    today = datetime.now(beijing_tz).strftime("%Y年%m月%d日")
+
+    prompt = f"""今天是 {today}。
+
+你是一位专业的全球金融市场编辑。请联网搜索最新的全球市场数据和相关财经新闻，然后生成一份既有数据又有洞察的行情简报。
+
+搜索要求：
+- 搜索关键词包括：world stock markets today, gold silver copper price, rare earth prices, S&P 500, Nasdaq, Dow Jones, FTSE, DAX, Nikkei 225, Hang Seng, Shanghai Composite, ASX 200 等
+- 同时搜索：今日A股、恒生指数、黄金价格、白银价格、铜价、稀土价格
+- 还要搜索：market news today, Fed interest rate, stock market analysis, 今日市场分析、央行政策、板块异动 等
+- 优先使用 Bloomberg、Reuters、CNBC、MarketWatch、Investing.com、Financial Times、金十数据、华尔街见闻 等金融数据源和财经媒体
+
+请严格按以下格式输出（第一行直接开始，不要任何前言或英文说明）：
+
+💹 全球市场简报 | {today}
+
+📈 全球股市
+
+🇺🇸 美股
+标普500：[点位] [涨跌幅%]
+纳斯达克：[点位] [涨跌幅%]
+道琼斯：[点位] [涨跌幅%]
+[1-2句话点评美股今日表现的驱动因素，如哪些板块领涨领跌、受什么消息影响。标注来源媒体名]
+
+🇨🇳 A股
+上证综指：[点位] [涨跌幅%]
+深证成指：[点位] [涨跌幅%]
+创业板指：[点位] [涨跌幅%]
+[1-2句话点评A股今日走势，如主力资金流向、板块热点、政策影响等。标注来源媒体名]
+
+🇭🇰 港股
+恒生指数：[点位] [涨跌幅%]
+恒生科技：[点位] [涨跌幅%]
+[1-2句话点评港股表现及驱动因素。标注来源媒体名]
+
+🇯🇵 日本
+日经225：[点位] [涨跌幅%]
+[1句话点评。标注来源媒体名]
+
+🇬🇧🇪🇺 欧洲
+富时100：[点位] [涨跌幅%]
+德国DAX：[点位] [涨跌幅%]
+法国CAC40：[点位] [涨跌幅%]
+[1-2句话点评欧洲市场表现。标注来源媒体名]
+
+🇦🇺 澳洲
+ASX 200：[点位] [涨跌幅%]
+[1句话点评。标注来源媒体名]
+
+🪙 贵金属 & 大宗商品
+
+黄金（XAUUSD）：[价格] 美元/盎司 [涨跌幅%]
+白银（XAGUSD）：[价格] 美元/盎司 [涨跌幅%]
+铜（COMEX）：[价格] 美元/磅 [涨跌幅%]
+原油（WTI）：[价格] 美元/桶 [涨跌幅%]
+原油（布伦特）：[价格] 美元/桶 [涨跌幅%]
+[1-2句话分析今日大宗商品价格波动的原因，如地缘政治、供需变化、美元走势等。标注来源媒体名]
+
+🔋 稀土 & 关键矿产
+
+[列出主要稀土品种的最新价格动态，如氧化镨钕、氧化镝、氧化铽等。如果搜不到实时价格，说明最近的价格趋势即可]
+[1句话点评稀土市场近期走势及影响因素。标注来源媒体名]
+
+🔍 今日值得关注
+
+[列出2-3个今天市场参与者应该重点关注的事项，比如：即将公布的经济数据、央行会议、大公司财报、政策动向等。每条1句话，标注来源媒体名]
+
+📝 编辑点评
+[2-3句话，用专业但易懂的语言概括今天全球市场的整体情绪、核心驱动因素，以及短期需要警惕或期待的信号]
+
+重要规则：
+- 所有数据必须是最新的，标注是收盘价还是盘中价
+- 涨用 📗 或 +，跌用 📕 或 -（或直接用正负号）
+- 如果某个市场当天未开盘或休市，注明"休市"
+- 全部用中文（专有名词和代码除外）
+- 不要使用任何Markdown格式符号，不要用星号加粗，不要用井号标题，输出纯文本
+- 不要出现"AI"这个词
+- 每条点评和新闻后面只需标注来源媒体名称（如：据Reuters、据Bloomberg、据CNBC），绝对不要附任何URL链接
+- 来源不明或无法确认的信息不要使用
+- 直接输出正文，第一行就是"💹 全球市场简报"，前面不要有任何英文"""
+
+    try:
+        print("正在获取全球市场行情数据...")
+        result = call_poe("Web-Search", [{"role": "user", "content": prompt}])
+        print("市场简报生成完成！")
+        return result
+    except Exception as e:
+        print(f"市场简报生成失败: {e}")
+        try:
+            print("尝试备用方案获取市场数据...")
+            result = call_poe("Gemini-2.0-Flash", [{"role": "user", "content": prompt}])
+            print("备用方案成功！")
+            return result
+        except Exception as e2:
+            print(f"备用方案也失败: {e2}")
+            return None
 
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
