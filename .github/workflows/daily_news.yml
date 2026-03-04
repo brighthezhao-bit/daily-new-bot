@@ -2,7 +2,7 @@ name: Daily Global Business News
 
 on:
   schedule:
-    - cron: '0 0 * * *'   # UTC 0:00 = 北京时间每天早上 8:00
+    - cron: '0 20 * * *'   # UTC 20:00 = 北京时间每天凌晨 4:00（预留延迟buffer）
   workflow_dispatch:        # 保留手动触发按钮
 
 jobs:
