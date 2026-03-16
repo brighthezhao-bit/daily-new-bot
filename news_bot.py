@@ -3,6 +3,7 @@ import requests
 import os
 import re
 import time
+import json
 from datetime import datetime, timezone, timedelta
 
 # 从环境变量获取 API Key 和 Telegram 配置
@@ -11,96 +12,212 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "你的TG_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID", "你的CHAT_ID")
 
 
-def call_poe(model, messages, temperature=0.5):
-    """调用 Poe API 的通用函数"""
-    client = openai.OpenAI(
-        api_key=POE_API_KEY,
-        base_url="https://api.poe.com/v1",
-    )
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        stream=False,
-        temperature=temperature,
-    )
-    return response.choices[0].message.content
+def validate_env():
+    """启动前检查关键配置，避免拿占位符去调用接口"""
+    missing = []
+    if not POE_API_KEY or POE_API_KEY == "你的POE_API_KEY":
+        missing.append("POE_API_KEY")
+    if not TELEGRAM_TOKEN or TELEGRAM_TOKEN == "你的TG_TOKEN":
+        missing.append("TELEGRAM_TOKEN")
+    if not CHAT_ID or CHAT_ID == "你的CHAT_ID":
+        missing.append("CHAT_ID")
+
+    if missing:
+        raise ValueError(f"缺少必要环境变量配置: {', '.join(missing)}")
+
+
+def call_poe(model, messages, temperature=0.5, max_retries=2):
+    """调用 Poe API 的通用函数，增加简单重试"""
+    last_error = None
+    for attempt in range(max_retries + 1):
+        try:
+            client = openai.OpenAI(
+                api_key=POE_API_KEY,
+                base_url="https://api.poe.com/v1",
+            )
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                stream=False,
+                temperature=temperature,
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            last_error = e
+            print(f"[call_poe] 第 {attempt + 1} 次调用失败: {e}")
+            if attempt < max_retries:
+                time.sleep(2)
+    raise last_error
 
 
 def clean_markdown(text):
     """
-    清理 Markdown 符号，使文本干干净净，适合微信群/纯文本阅读。
-    同时将标题符号转换为纯文本的排版符号，保留层次感。
+    清理 Markdown 符号，使文本适合 Telegram/微信群/纯文本阅读。
+    由于新版简报本来就要求极简，这里只做温和清洗，避免误伤正文。
     """
-    # 1. 去除加粗和斜体的星号 **文字** 或 *文字* -> 文字
+    # 去掉粗体/斜体星号
     text = re.sub(r'\*{1,2}(.*?)\*{1,2}', r'\1', text)
-    
-    # 2. 将三级标题 ### 替换为 【】 括号 (用于7大区域的标题)
-    text = re.sub(r'^###\s+(.*)', r'【\1】', text, flags=re.MULTILINE)
-    
-    # 3. 将二级标题 ## 替换为 ■ 符号
-    text = re.sub(r'^##\s+(.*)', r'■ \1', text, flags=re.MULTILINE)
-    
-    # 4. 去除一级标题 # 
-    text = re.sub(r'^#\s+(.*)', r'\1', text, flags=re.MULTILINE)
-    
-    # 5. 清理多余的空行（将3个以上的连续换行替换为2个）
+
+    # 去掉 Markdown 标题符号
+    text = re.sub(r'^\s*#{1,6}\s*', '', text, flags=re.MULTILINE)
+
+    # 去掉无意义项目符号，但保留箭头
+    text = re.sub(r'^\s*[-•]\s+', '', text, flags=re.MULTILINE)
+
+    # 压缩多余空行
     text = re.sub(r'\n{3,}', '\n\n', text)
-    
+
     return text.strip()
 
 
-def strip_english_preamble(text):
-    """清理大模型可能带有的废话前缀，直接保留正文主体"""
-    markers = ["🌍 全球情绪早报", "全球情绪早报", "过滤全球商业噪音"]
+def strip_report_preamble(text):
+    """清理模型可能加的说明性前缀，只保留从正式标题开始的内容"""
+    markers = [
+        "🌍 今日全球情绪",
+        "今日全球情绪",
+        "🌍 全球情绪早报",
+        "全球情绪早报",
+    ]
     earliest_pos = len(text)
     for marker in markers:
         pos = text.find(marker)
         if pos != -1 and pos < earliest_pos:
             earliest_pos = pos
-            
+
     if earliest_pos < len(text) and earliest_pos > 0:
-        # 如果前面有废话，从标记处截断
-        stripped = text[earliest_pos:]
-        return stripped
-        
-    return text
+        return text[earliest_pos:].strip()
+
+    return text.strip()
+
+
+def save_text_file(prefix, content):
+    """保存原始结果到本地，方便抽检和排查"""
+    try:
+        os.makedirs("logs", exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join("logs", f"{prefix}_{ts}.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        print(f"[保存成功] {path}")
+    except Exception as e:
+        print(f"[保存失败] {e}")
 
 
 # ==============================================================
-#  第一道：Web-Search 定向搜索海外主流媒体 (按7大区域)
+#  第一道：Web-Search 定向搜索海外主流媒体（结构化候选池）
 # ==============================================================
 
 def fetch_overseas_intelligence():
-    """第一道：仅限搜索海外主流英文媒体，提取7大区域核心商业情报"""
+    """
+    第一阶段：
+    用 Web-Search 扫描全球主流英文媒体，并尽量结构化输出候选新闻。
+    目标不是直接写成品，而是拿到更可审查的原始候选池。
+    """
     beijing_tz = timezone(timedelta(hours=8))
-    today = datetime.now(beijing_tz).strftime("%Y年%m月%d日")
+    utc_tz = timezone.utc
+    beijing_now = datetime.now(beijing_tz)
+    utc_now = datetime.now(utc_tz)
 
-    prompt = f"""今天是 {today}。
+    today_cn = beijing_now.strftime("%Y年%m月%d日")
+    today_iso = beijing_now.strftime("%Y.%m.%d")
+    utc_now_str = utc_now.strftime("%Y-%m-%d %H:%M UTC")
 
-请你作为一个高级商业情报检索员，联网搜索过去24小时内全球最重要的商业与科技情报。
+    prompt = f"""今天是北京时间 {today_cn}，当前 UTC 时间约为 {utc_now_str}。
+
+请你作为一个高级商业情报检索员，联网搜索过去24小时内全球最重要的商业、科技、能源、供应链、贸易与宏观经济动态，供后续生成一份【精简版全球情绪简报】。
+
+【时间要求：必须严格执行】
+1. 仅保留“过去24小时内发布或更新”的信息。
+2. 如果某条新闻无法确认发布时间，请降低优先级；如果明显不是过去24小时，请不要收录。
+3. 输出时必须尽量写明发布时间（原文时间或你能确认的时间表述）。
+
+【媒体白名单：优先这些来源】
+全球/财经/科技主媒体：
+- Reuters
+- Bloomberg
+- The Wall Street Journal
+- Financial Times
+- CNBC
+- The Economist
+- TechCrunch
+
+区域补充媒体：
+- Nikkei Asia
+- Al Jazeera
+- The National
+- Arab News
+- The Japan Times
+- The Korea Herald
+- Straits Times
+- Australian Financial Review
+- Business Day
 
 【严格搜索红线】
-1. 仅限检索海外主流英文媒体（如 Bloomberg, WSJ, Financial Times, Reuters, CNBC, The Economist, TechCrunch 等）。
-2. 严禁引用任何中国国内中文媒体的二手报道。
-3. 严格聚焦商业模式创新、前沿科技、全球宏观经济政策、出海与全球贸易。
-4. 过滤掉纯政治体制、意识形态攻击等敏感话题，只提取纯粹的商业和经济影响。
+1. 严禁引用中国国内中文媒体二手报道。
+2. 严格聚焦：商业模式创新、前沿科技、宏观政策、能源价格、全球贸易、物流航运、供应链、跨境投资、出海。
+3. 过滤纯政治口水、意识形态攻击、无商业影响的外交新闻。
 
-【定向检索任务】
-请务必分别检索以下 **7个区域** 过去24小时的核心动态，并输出原始素材（需包含外媒来源、核心事实数据、当地市场情绪）：
-1. 北美（美国、加拿大）
-2. 欧洲（英国、法国、德国及欧盟核心国）
-3. 日韩东南亚（日本、韩国、东盟国家）
-4. 澳新（澳大利亚、新西兰）
-5. 南美（巴西、阿根廷等）
-6. 非洲中东（沙特、阿联酋、南非等）
-7. 中亚和蒙古（哈萨克斯坦、蒙古国等）
+【扫描区域】
+1. 🇺🇸 北美
+2. 🇪🇺 欧洲
+3. 🌏 亚太
+4. 🦘 澳新
+5. 💃 南美
+6. 🐪 非洲中东
+7. 🐎 中亚和蒙古
 
-注意：这只是给下一步分析的原始素材，请确保信息密度极高，客观准确，务必标注具体的外媒来源。"""
+【输出目标】
+请按区域输出“候选情报池”，每个区域最多保留 1-2 条最值得进入简报候选池的新闻。
+如果某个区域没有足够重要的内容，就写：无足够重要动态
+
+【每条候选必须尽量包含以下字段】
+- 来源：
+- 标题：
+- 发布时间：
+- 链接：
+- 核心事实：
+- 市场/区域情绪：
+- 价值判断：
+
+【格式必须严格如下】
+
+【🇺🇸 北美】
+1.
+来源：
+标题：
+发布时间：
+链接：
+核心事实：
+市场/区域情绪：
+价值判断：
+
+2.
+来源：
+标题：
+发布时间：
+链接：
+核心事实：
+市场/区域情绪：
+价值判断：
+
+【🇪🇺 欧洲】
+...
+
+如果无重要动态，写：
+无足够重要动态
+
+注意：
+- 不要生成最终简报
+- 不要写前言总结
+- 只输出候选情报池
+- 尽量使用明确媒体名，避免“据外媒报道”这种模糊说法
+"""
 
     try:
-        print("第一道：正在定向检索海外主流媒体情报(7大区域)...")
+        print("第一道：正在定向检索海外主流媒体情报（结构化候选池）...")
         result = call_poe("Web-Search", [{"role": "user", "content": prompt}], temperature=0.1)
-        print("海外情报原始素材获取完成！")
+        print("海外情报候选池获取完成！")
+        save_text_file("raw_candidates", result)
         return result
     except Exception as e:
         print(f"海外情报搜索失败: {e}")
@@ -108,79 +225,100 @@ def fetch_overseas_intelligence():
 
 
 # ==============================================================
-#  第二道：生成《全球情绪早报》（核心业务逻辑）
+#  第二道：筛选成【最多3个区域】的精简版简报
 # ==============================================================
 
 def generate_morning_report(raw_intelligence):
-    """第二道：根据新要求，使用 opus-4.6 生成高质量早报"""
+    """第二阶段：基于候选池生成精简版全球情绪简报"""
     beijing_tz = timezone(timedelta(hours=8))
-    today = datetime.now(beijing_tz).strftime("%Y年%m月%d日")
+    today = datetime.now(beijing_tz).strftime("%Y.%m.%d")
 
-    prompt = f"""你现在是“奇怪地球咨询社”的首席商业情报分析师。你的任务是基于我提供的海外媒体原始情报，为国内高管和创业者生成一份高质量的《全球情绪早报》。
+    prompt = f"""# 角色
+你是「奇怪地球咨询社」的全球商业情绪简报助手。
 
-【语言风格与人设指南】
-1. 称呼规则（必须使用）：美国→老美，中国→东大，日本→小日子，欧洲→欧洲老钱，韩国→思密达，印度→三哥。
-2. 语气要求：犀利、专业的“老炮”口吻。要有反共识的商业判断，指出事件对“东大”出海者或创业者的实质影响。不要用“震惊/重磅”等标题党。
+# 任务
+基于我提供的全球新闻/情报候选池，生成一份【精简版】全球情绪简报，供主理人直接转发到私域群。
 
-以下是今天检索到的海外原始情报：
-===情报开始===
+# 核心原则
+1. 每天只挑【最多3个】最值得说的区域，不是每天7个全覆盖。如果某个区域当天没有值得说的事，就不出现。出现即意味着今天这里有事。
+2. 每个区域的情报压缩到【1条最核心】。不要堆砌。
+3. 情绪标签要有区分度。如果多个区域情绪类似，只保留最典型的那个区域，其余砍掉。追求反差感——全球焦虑时，如果有一个区域是兴奋的，优先保留它。
+4. 选择标准优先级如下：
+   - 是否明确来自过去24小时的候选新闻
+   - 是否来自更硬的媒体信源
+   - 是否对全球商业/科技/能源/供应链/跨境贸易有现实影响
+   - 是否对中国创业者、制造业、出海卖家、投资圈有现实意义
+   - 是否一句话就能讲清楚
+5. 「奇怪地球意见」部分要求：
+   - 最多2-3句话
+   - 必须说人话，像一个做过生意、去过现场的人在群里聊天，不是宏观分析师写报告
+   - 优先使用以下句式风格：
+     → "做XX生意的朋友注意，……"
+     → "跟我在XX看到的一样，……"
+     → "说白了就是……"
+     → "别只盯着XX，真正的机会在……"
+6. 禁止使用以下空话套话：
+   ✗ "企业可以关注"
+   ✗ "未雨绸缪"
+   ✗ "多元化布局"
+   ✗ "不可小觑"
+   ✗ "长袖善舞"
+   ✗ "如履薄冰"
+   ✗ "捉襟见肘"
+7. 整篇简报，群友30秒内能看完。
+
+# 可选区域池
+- 🇺🇸 北美
+- 🇪🇺 欧洲
+- 🌏 亚太
+- 🦘 澳新
+- 💃 南美
+- 🐪 非洲中东
+- 🐎 中亚和蒙古
+
+# 情绪标签可选项
+😰 焦虑 | 😓 压力 | 😨 紧张 | 🤔 观望 | 😐 平稳 | 🤑 兴奋 | 😎 乐观 | 🥶 冷淡 | 🔥 火热
+
+以下是今天检索到的候选情报池：
+===候选池开始===
 {raw_intelligence}
-===情报结束===
+===候选池结束===
 
-请严格按照以下结构输出早报（大模型内部请使用Markdown辅助生成，后续代码会清理符号，请保持结构清晰）：
+# 输出格式（严格遵守）
+🌍 今日全球情绪 | {today}
 
-# 🌍 全球情绪早报
-消除信息差，同步海外核心视野。 —— {today}
+[区域emoji] [区域名] [情绪emoji] [情绪词]
+[一句话核心情报，必须带明确外媒信源]
+→ [奇怪地球意见，1-3句，说人话]
 
-（请严格按照以下7个区域输出，每个区域必须包含情绪、核心情报、奇怪地球意见三项，不要增加多余的废话。如果没有该区域的重大新闻，请用一句话概括其宏观现状。）
+[区域emoji] [区域名] [情绪emoji] [情绪词]
+[一句话核心情报，必须带明确外媒信源]
+→ [奇怪地球意见，1-3句，说人话]
 
-### 1. 🇺🇸 北美
-🌡️ 情绪：[使用1个Emoji + 2个字的词语，例如：😰 焦虑 / 🤑 亢奋 / 🤔 观望]
-📡 核心情报：[用极度精简的语言，主谓宾结构，列出2-3条核心事实，必须带上外媒信源，如“据WSJ报道...”]
-💡 奇怪地球意见：[这是灵魂！用犀利老炮口吻，给出反共识的商业判断或对东大出海、经济的实质影响]
+（如有第三个区域，同上格式；如果不够重要，只输出1-2个区域，不要凑数）
 
-### 2. 🇪🇺 欧洲
-🌡️ 情绪：[Emoji + 2字]
-📡 核心情报：[精简事实 + 外媒信源]
-💡 奇怪地球意见：[犀利点评]
+抹平全球市场信息差。大家发财。
 
-### 3. 🌏 日韩东南亚
-🌡️ 情绪：[Emoji + 2字]
-📡 核心情报：[精简事实 + 外媒信源]
-💡 奇怪地球意见：[犀利点评]
-
-### 4. 🦘 澳新
-🌡️ 情绪：[Emoji + 2字]
-📡 核心情报：[精简事实 + 外媒信源]
-💡 奇怪地球意见：[犀利点评]
-
-### 5. 💃 南美
-🌡️ 情绪：[Emoji + 2字]
-📡 核心情报：[精简事实 + 外媒信源]
-💡 奇怪地球意见：[犀利点评]
-
-### 6. 🐪 非洲中东
-🌡️ 情绪：[Emoji + 2字]
-📡 核心情报：[精简事实 + 外媒信源]
-💡 奇怪地球意见：[犀利点评]
-
-### 7. 🐎 中亚和蒙古
-🌡️ 情绪：[Emoji + 2字]
-📡 核心情报：[精简事实 + 外媒信源]
-💡 奇怪地球意见：[犀利点评]
-
-奇怪地球咨询社｜抹平全球市场信息差
+# 严格限制
+- 不要写前言、解释、备注
+- 不要输出Markdown标题
+- 不要使用项目符号
+- 不要出现“以下是”
+- 直接输出最终成稿
+- 如果候选池里没有足够高价值的内容，宁可只写1个区域，也不要凑3个
 """
 
     try:
-        print("第二道：正在使用 opus-4.6 深度思考并生成《全球情绪早报》...")
+        print("第二道：正在使用 opus-4.6 生成《精简版全球情绪》...")
         result = call_poe("opus-4.6", [{"role": "user", "content": prompt}], temperature=0.6)
-        print("《全球情绪早报》生成完毕 ✅")
+        print("《精简版全球情绪》生成完毕 ✅")
+        save_text_file("final_report_raw", result)
         return result
     except Exception as e:
         print(f"opus-4.6 失败，尝试备用模型 GPT-4o: {e}")
         try:
             result = call_poe("GPT-4o", [{"role": "user", "content": prompt}], temperature=0.6)
+            save_text_file("final_report_raw_fallback", result)
             return result
         except Exception as e2:
             print(f"全部失败: {e2}")
@@ -188,58 +326,91 @@ def generate_morning_report(raw_intelligence):
 
 
 # ==============================================================
-#  发送模块（针对微信防折叠优化）
+#  发送模块（针对 Telegram / 微信转发优化）
 # ==============================================================
+
+def split_text_safely(text, max_length=800):
+    """
+    将文本按相对自然的边界切分，避免一句话被切太碎。
+    """
+    chunks = []
+    text = text.strip()
+
+    while len(text) > 0:
+        if len(text) <= max_length:
+            chunks.append(text)
+            break
+
+        # 优先按双换行切
+        split_pos = text.rfind("\n\n", 0, max_length)
+
+        # 再按单换行切
+        if split_pos == -1:
+            split_pos = text.rfind("\n", 0, max_length)
+
+        # 再按句号切
+        if split_pos == -1:
+            split_pos = text.rfind("。", 0, max_length)
+
+        # 实在找不到就硬切
+        if split_pos == -1 or split_pos < int(max_length * 0.5):
+            split_pos = max_length
+
+        chunk = text[:split_pos].strip()
+        if chunk:
+            chunks.append(chunk)
+
+        text = text[split_pos:].strip()
+
+    return chunks
+
 
 def send_telegram(text):
     """
     发送消息到 Telegram。
     针对微信转发进行优化：将单条消息长度限制在 800 字左右，防止微信折叠。
+    增加分段序号和简单重试。
     """
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    
-    # 微信防折叠安全长度设定为 800 字符
-    MAX_LENGTH = 800 
-    chunks = []
-    
-    while len(text) > 0:
-        if len(text) <= MAX_LENGTH:
-            chunks.append(text)
-            break
-            
-        # 寻找最近的段落分割点（双换行），避免把一句话切断
-        split_pos = text.rfind("\n\n", 0, MAX_LENGTH)
-        
-        # 如果找不到双换行，退而求其次找单换行
-        if split_pos == -1:
-            split_pos = text.rfind("\n", 0, MAX_LENGTH)
-            
-        # 如果连换行都没有（极端情况），硬切
-        if split_pos == -1:
-            split_pos = MAX_LENGTH
-            
-        chunks.append(text[:split_pos].strip())
-        text = text[split_pos:].strip()
+    chunks = split_text_safely(text, max_length=800)
 
-    for i, chunk in enumerate(chunks):
+    total = len(chunks)
+
+    for i, chunk in enumerate(chunks, 1):
         if not chunk:
             continue
-            
+
+        # 如果分段超过 1 段，则添加序号
+        display_text = chunk
+        if total > 1:
+            display_text = f"({i}/{total})\n{chunk}"
+
         payload = {
             "chat_id": CHAT_ID,
-            "text": chunk,
+            "text": display_text,
             "disable_web_page_preview": True,
         }
-        try:
-            resp = requests.post(url, json=payload, timeout=30)
-            if resp.status_code == 200:
-                print(f"Telegram 发送成功 ({i+1}/{len(chunks)})")
-            else:
-                print(f"Telegram 发送失败: {resp.text}")
-            # 增加延迟，防止消息顺序错乱
+
+        success = False
+        for attempt in range(3):
+            try:
+                resp = requests.post(url, json=payload, timeout=30)
+                if resp.status_code == 200:
+                    print(f"Telegram 发送成功 ({i}/{total})")
+                    success = True
+                    break
+                else:
+                    print(f"Telegram 发送失败 ({i}/{total}) 第 {attempt + 1} 次: {resp.text}")
+            except Exception as e:
+                print(f"发送出错 ({i}/{total}) 第 {attempt + 1} 次: {e}")
+
             time.sleep(2)
-        except Exception as e:
-            print(f"发送出错: {e}")
+
+        if not success:
+            print(f"第 {i}/{total} 段最终发送失败。")
+
+        # 控制顺序，避免消息乱序
+        time.sleep(1.5)
 
 
 # ==============================================================
@@ -247,37 +418,42 @@ def send_telegram(text):
 # ==============================================================
 
 def main():
-    print("=" * 50)
-    print("🌍 奇怪地球咨询社 · 首席情报系统启动")
-    print("=" * 50)
+    print("=" * 60)
+    print("🌍 奇怪地球咨询社 · 精简版全球情绪系统启动")
+    print("=" * 60)
 
-    # 1. 抓取海外情报
-    raw_intelligence = fetch_overseas_intelligence()
-    
-    if not raw_intelligence:
-        send_telegram("⚠️ 今日海外情报获取失败，请检查网络或 Poe API 状态。")
+    try:
+        validate_env()
+    except Exception as e:
+        print(f"配置检查失败: {e}")
         return
 
-    time.sleep(3) 
+    # 1. 抓取海外候选情报池
+    raw_intelligence = fetch_overseas_intelligence()
 
-    # 2. 生成最终早报 (使用 opus-4.6)
+    if not raw_intelligence:
+        send_telegram("⚠️ 今日海外情报候选池获取失败，请检查网络或 Poe API 状态。")
+        return
+
+    time.sleep(3)
+
+    # 2. 生成最终简报
     final_report = generate_morning_report(raw_intelligence)
 
     if final_report:
-        # 清理废话前缀
-        final_report = strip_english_preamble(final_report)
-        # 核心：清理 Markdown 符号，保证输出干干净净
+        final_report = strip_report_preamble(final_report)
         final_report = clean_markdown(final_report)
-        
-        print("\n--- 开始发送早报 ---")
-        print(final_report) # 在本地打印预览一下干净的排版
+
+        print("\n--- 开始发送简报 ---")
+        print(final_report)
+        save_text_file("final_report_clean", final_report)
         send_telegram(final_report)
     else:
-        send_telegram("⚠️ 今日《全球情绪早报》生成失败。")
+        send_telegram("⚠️ 今日《全球情绪简报》生成失败。")
 
-    print("\n" + "=" * 50)
+    print("\n" + "=" * 60)
     print("今日情报任务全部完成 ✅")
-    print("=" * 50)
+    print("=" * 60)
 
 
 if __name__ == "__main__":
